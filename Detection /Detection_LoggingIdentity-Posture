@@ -1,0 +1,391 @@
+# ============================================================
+# [MODULE] Detection / Logging / Identity Posture (Red Team)
+# ============================================================
+function Write-Section($Title) {
+    Write-Host ""
+    Write-Host ("=" * 60) -ForegroundColor DarkCyan
+    Write-Host "  $Title" -ForegroundColor Cyan
+    Write-Host ("=" * 60) -ForegroundColor DarkCyan
+}
+function Write-Sub($Title) {
+    Write-Host ""
+    Write-Host "  --- $Title ---" -ForegroundColor Magenta
+}
+function Write-KV($Key, $Value, $Color = "White") {
+    Write-Host ("  {0,-38}" -f $Key) -ForegroundColor Gray -NoNewline
+    Write-Host $Value -ForegroundColor $Color
+}
+function Write-Good($Msg) { Write-Host "  [+] $Msg" -ForegroundColor Green }
+function Write-Bad($Msg)  { Write-Host "  [-] $Msg" -ForegroundColor Red }
+function Write-Warn($Msg) { Write-Host "  [!] $Msg" -ForegroundColor Yellow }
+function Write-Info($Msg) { Write-Host "  [*] $Msg" -ForegroundColor DarkGray }
+
+$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$findings = New-Object System.Collections.Generic.List[string]
+
+Write-Section "DETECTION / LOGGING / IDENTITY POSTURE"
+Write-Info ("Privilege: " + $(if ($IsAdmin) {'ADMIN'} else {'NON-ADMIN — some checks will be skipped'}))
+
+# ============================================================
+# [1/10] SYSMON
+# ============================================================
+Write-Sub "[1/10] Sysmon"
+$sysmonFound = $false
+
+# Buscar servicio por nombre clásico
+$sysmonSvcs = Get-CimInstance Win32_Service -EA SilentlyContinue | Where-Object {
+    $_.PathName -match 'sysmon' -or $_.Name -match '^Sysmon' -or $_.Description -match 'Sysmon'
+}
+foreach ($s in $sysmonSvcs) {
+    $sysmonFound = $true
+    Write-KV "Service" "$($s.Name)  ($($s.State))  Path=$($s.PathName)" 'Yellow'
+}
+# Driver SysmonDrv
+try {
+    $drv = Get-CimInstance Win32_SystemDriver -EA Stop | Where-Object { $_.Name -match 'Sysmon' -or $_.PathName -match 'sysmon' }
+    foreach ($d in $drv) {
+        $sysmonFound = $true
+        Write-KV "Driver" "$($d.Name)  State=$($d.State)  $($d.PathName)" 'Yellow'
+    }
+} catch {}
+
+# Sysmon puede estar renombrado. Comprobar por driver Altitude (Sysmon usa 385201)
+try {
+    $altKeys = Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services' -EA SilentlyContinue | ForEach-Object {
+        $p = Join-Path $_.PSPath 'Instances'
+        if (Test-Path $p) {
+            $alt = (Get-ItemProperty $p -EA SilentlyContinue).DefaultInstance
+            if ($alt) {
+                $instKey = Join-Path $p $alt
+                $altitude = (Get-ItemProperty $instKey -EA SilentlyContinue).Altitude
+                if ($altitude -eq '385201') {
+                    [PSCustomObject]@{ Service = $_.PSChildName; Altitude = $altitude }
+                }
+            }
+        }
+    }
+    foreach ($a in $altKeys) {
+        $sysmonFound = $true
+        Write-Warn "Possible renamed Sysmon driver: $($a.Service) (altitude 385201)"
+    }
+} catch {}
+
+if ($sysmonFound) {
+    $findings.Add("Sysmon detected — assume command-line, hash, network and image-load logging")
+    # Config hash si admin
+    if ($IsAdmin) {
+        try {
+            $cfg = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\SysmonDrv\Parameters' -EA Stop
+            if ($cfg.ConfigHash) { Write-KV "ConfigHash" $cfg.ConfigHash 'Yellow' }
+            if ($cfg.Rules)      { Write-KV "Rules blob size" "$($cfg.Rules.Length) bytes" 'Yellow' }
+        } catch {}
+    }
+} else {
+    Write-Good "No Sysmon service/driver detected"
+}
+
+# ============================================================
+# [2/10] AUDIT POLICY + COMMAND-LINE LOGGING
+# ============================================================
+Write-Sub "[2/10] Audit Policy"
+if ($IsAdmin) {
+    try {
+        $audit = (auditpol /get /category:* /r 2>$null) | ConvertFrom-Csv
+        $enabled = $audit | Where-Object { $_.'Inclusion Setting' -match 'Success|Failure' }
+        Write-KV "Total subcategories audited" $enabled.Count ($(if ($enabled.Count -gt 30) {'Red'} else {'Green'}))
+        # Subcategorías críticas
+        $crit = @(
+            'Process Creation','Process Termination',
+            'Logon','Logoff','Special Logon',
+            'Sensitive Privilege Use',
+            'Credential Validation','Kerberos Authentication Service','Kerberos Service Ticket Operations',
+            'Other Object Access Events','File System','Registry',
+            'Audit Policy Change','Authentication Policy Change'
+        )
+        foreach ($c in $crit) {
+            $row = $audit | Where-Object { $_.Subcategory -eq $c }
+            if ($row) {
+                $val = $row.'Inclusion Setting'
+                $col = if ($val -match 'Success and Failure') {'Red'} elseif ($val -match 'Success|Failure') {'Yellow'} else {'DarkGray'}
+                Write-KV "  $c" $val $col
+            }
+        }
+    } catch { Write-Info "auditpol failed: $_" }
+} else {
+    Write-Info "auditpol requires admin"
+}
+
+# Command-line in Event 4688 (clave)
+try {
+    $cmdAudit = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -EA Stop).ProcessCreationIncludeCmdLine_Enabled
+    Write-KV "ProcessCreation Cmdline (4688)" $cmdAudit ($(if ($cmdAudit -eq 1) {'Red'} else {'Green'}))
+    if ($cmdAudit -eq 1) { $findings.Add("4688 includes command line — every process exec logs full cmdline") }
+} catch { Write-KV "ProcessCreation Cmdline (4688)" "Not configured" 'Green' }
+
+# ============================================================
+# [3/10] WINDOWS EVENT FORWARDING (WEF → SIEM)
+# ============================================================
+Write-Sub "[3/10] Event Forwarding (WEF)"
+$wefKeys = @(
+    'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager',
+    'HKLM:\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager'
+)
+$wefFound = $false
+foreach ($k in $wefKeys) {
+    if (Test-Path $k) {
+        $vals = Get-ItemProperty $k -EA SilentlyContinue
+        foreach ($p in $vals.PSObject.Properties) {
+            if ($p.Name -match '^\d+$') {
+                $wefFound = $true
+                Write-KV "Forwarder target" $p.Value 'Yellow'
+            }
+        }
+    }
+}
+if ($wefFound) {
+    $findings.Add("WEF forwarding configured — logs are leaving the host")
+} else {
+    Write-Good "No WEF forwarder configured"
+}
+# Servicio WecSvc (lado collector) y Wecutil
+$wec = Get-Service Wecsvc -EA SilentlyContinue
+if ($wec -and $wec.Status -eq 'Running') { Write-Warn "Wecsvc running — host might BE a WEF collector" }
+
+# ============================================================
+# [4/10] ETW TELEMETRY SESSIONS
+# ============================================================
+Write-Sub "[4/10] ETW telemetry sessions"
+try {
+    $traces = (logman query -ets 2>$null) | Where-Object { $_ -match '^\S' -and $_ -notmatch '^Data Collector|^---|^The command|^$|^Name' }
+    $interesting = @('Defender','Sense','DiagTrack','EventLog-Security','MDE','CrowdStrike','SentinelOne','Cylance','CarbonBlack','Tanium','ATP','Threat')
+    foreach ($line in $traces) {
+        $name = ($line -split '\s{2,}')[0]
+        if (-not $name) { continue }
+        $hit = $false
+        foreach ($i in $interesting) { if ($name -match $i) { $hit = $true; break } }
+        if ($hit) {
+            Write-Host "    $name" -ForegroundColor Yellow
+        }
+    }
+    # PowerShell ETW provider activo siempre
+    Write-Info "Note: Microsoft-Windows-PowerShell ETW is always exposed (operational + analytic)"
+} catch { Write-Info "logman not available" }
+
+# ============================================================
+# [5/10] LSA / LSASS PROTECTION
+# ============================================================
+Write-Sub "[5/10] LSA / LSASS Protection"
+try {
+    $lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -EA Stop
+    $rap = $lsa.RunAsPPL
+    $col = if ($rap -eq 1 -or $rap -eq 2) {'Red'} else {'Green'}
+    Write-KV "RunAsPPL (LSASS PPL)" $rap $col
+    if ($rap -ge 1) { $findings.Add("LSASS runs as PPL — classic mimikatz read blocked (need driver/CVE)") }
+    Write-KV "LmCompatibilityLevel" $lsa.LmCompatibilityLevel
+    Write-KV "LimitBlankPasswordUse" $lsa.LimitBlankPasswordUse
+    Write-KV "RestrictAnonymous" $lsa.RestrictAnonymous
+    Write-KV "RestrictAnonymousSAM" $lsa.RestrictAnonymousSAM
+    Write-KV "LsaCfgFlags (CredGuard)" $lsa.LsaCfgFlags ($(if ($lsa.LsaCfgFlags -ge 1) {'Red'} else {'Green'}))
+    if ($lsa.LsaCfgFlags -ge 1) { $findings.Add("Credential Guard enabled — TGT/NTLM hashes isolated in VTL1") }
+} catch { Write-Info "Cannot read HKLM\...\Lsa" }
+
+# WDigest UseLogonCredential (1 = clear text creds in LSASS)
+try {
+    $wd = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -EA Stop).UseLogonCredential
+    if ($wd -eq 1) {
+        Write-Bad "WDigest UseLogonCredential = 1 (clear-text creds in LSASS — easy win)"
+        $findings.Add("WDigest cleartext enabled — extract plaintext creds from LSASS")
+    } else {
+        Write-KV "WDigest UseLogonCredential" $wd 'Green'
+    }
+} catch { Write-KV "WDigest UseLogonCredential" "Not set (default 0)" 'Green' }
+
+# Cached logons
+try {
+    $cached = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -EA Stop).CachedLogonsCount
+    Write-KV "CachedLogonsCount" $cached
+    if ([int]$cached -gt 0) { Write-Info "Cached domain creds (MSCACHE) may be extractable offline if SYSTEM" }
+} catch {}
+
+# RestrictedAdmin / DisableRestrictedAdmin
+try {
+    $ra = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -EA Stop).DisableRestrictedAdmin
+    Write-KV "DisableRestrictedAdmin" $ra
+} catch {}
+
+# ============================================================
+# [6/10] UAC
+# ============================================================
+Write-Sub "[6/10] UAC configuration"
+try {
+    $u = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -EA Stop
+    Write-KV "EnableLUA" $u.EnableLUA ($(if ($u.EnableLUA -eq 0) {'Red'} else {'Green'}))
+    if ($u.EnableLUA -eq 0) { $findings.Add("UAC disabled (EnableLUA=0) — admins get full token immediately") }
+    Write-KV "ConsentPromptBehaviorAdmin" $u.ConsentPromptBehaviorAdmin ($(
+        switch ($u.ConsentPromptBehaviorAdmin) {
+            0 {'Red'}   # No prompt — auto elevate
+            1 {'Yellow'}
+            2 {'Yellow'}
+            5 {'Green'} # Default secure desktop
+            default {'White'}
+        }))
+    Write-KV "ConsentPromptBehaviorUser" $u.ConsentPromptBehaviorUser
+    Write-KV "PromptOnSecureDesktop" $u.PromptOnSecureDesktop
+    Write-KV "FilterAdministratorToken" $u.FilterAdministratorToken
+    Write-KV "LocalAccountTokenFilterPolicy" $u.LocalAccountTokenFilterPolicy ($(if ($u.LocalAccountTokenFilterPolicy -eq 1) {'Red'} else {'Green'}))
+    if ($u.LocalAccountTokenFilterPolicy -eq 1) {
+        $findings.Add("LocalAccountTokenFilterPolicy=1 — remote local-admin gets full token (lateral via SMB/PSExec works)")
+    }
+    Write-KV "EnableInstallerDetection" $u.EnableInstallerDetection
+    if ($u.ConsentPromptBehaviorAdmin -eq 0 -and $u.EnableLUA -eq 1) {
+        $findings.Add("UAC in 'Elevate without prompting' — silent auto-elevation for admins")
+    }
+} catch { Write-Info "Cannot read UAC policy keys" }
+
+# ============================================================
+# [7/10] NTLM RESTRICTIONS
+# ============================================================
+Write-Sub "[7/10] NTLM restrictions"
+try {
+    $msv = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' -EA Stop
+    $send = $msv.RestrictSendingNTLMTraffic
+    $recv = $msv.RestrictReceivingNTLMTraffic
+    $audit = $msv.AuditReceivingNTLMTraffic
+    $sendMap = @{0='Allow all';1='Audit all';2='Deny all'}
+    Write-KV "RestrictSendingNTLMTraffic"  ("{0}  ({1})" -f $send,$sendMap[[int]$send]) ($(if ($send -eq 2) {'Red'} elseif ($send -eq 1) {'Yellow'} else {'Green'}))
+    Write-KV "RestrictReceivingNTLMTraffic" ("{0}  ({1})" -f $recv,$sendMap[[int]$recv]) ($(if ($recv -eq 2) {'Red'} elseif ($recv -eq 1) {'Yellow'} else {'Green'}))
+    Write-KV "AuditReceivingNTLMTraffic"   $audit
+    Write-KV "NTLMMinClientSec"            ("0x{0:X}" -f [int]$msv.NTLMMinClientSec)
+    Write-KV "NTLMMinServerSec"            ("0x{0:X}" -f [int]$msv.NTLMMinServerSec)
+    if ($recv -eq 1) { $findings.Add("NTLM auth attempts are AUDITED on this host (8001-8004 events)") }
+    if ($recv -eq 2) { $findings.Add("Incoming NTLM is BLOCKED — relay/coerce useless against this host") }
+} catch { Write-Info "MSV1_0 NTLM keys not readable" }
+
+# Extended Protection for Authentication / SMB signing
+try {
+    $smb = Get-SmbServerConfiguration -EA Stop
+    Write-KV "SMB Signing Required"  $smb.RequireSecuritySignature ($(if ($smb.RequireSecuritySignature) {'Green'} else {'Red'}))
+    Write-KV "SMB Signing Enabled"   $smb.EnableSecuritySignature
+    Write-KV "SMBv1 Enabled"         $smb.EnableSMB1Protocol ($(if ($smb.EnableSMB1Protocol) {'Red'} else {'Green'}))
+    if (-not $smb.RequireSecuritySignature) { $findings.Add("SMB signing NOT required — relay attacks viable") }
+} catch {}
+
+# ============================================================
+# [8/10] LAPS
+# ============================================================
+Write-Sub "[8/10] LAPS"
+$lapsFound = $false
+# Windows LAPS (nuevo, 2023+)
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config' -PathType Container) {
+    $lapsFound = $true
+    Write-Warn "Windows LAPS (new) configured"
+    try {
+        $lc = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config' -EA Stop
+        Write-KV "  BackupDirectory" $lc.BackupDirectory  # 0=Disabled,1=AAD,2=AD
+        Write-KV "  AdministratorAccountName" $lc.AdministratorAccountName
+        Write-KV "  PasswordAgeDays" $lc.PasswordAgeDays
+    } catch {}
+}
+foreach ($svc in 'LapsSvc','laps') {
+    $s = Get-Service $svc -EA SilentlyContinue
+    if ($s) { $lapsFound = $true; Write-KV "Service $svc" "$($s.Status)" 'Yellow' }
+}
+# Legacy LAPS (AdmPwd)
+if (Test-Path "$env:WINDIR\System32\AdmPwd.dll") {
+    $lapsFound = $true
+    Write-Warn "Legacy LAPS (AdmPwd.dll) installed"
+}
+if (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd') {
+    $lapsFound = $true
+    Write-Warn "Legacy LAPS policy present (HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd)"
+}
+if (-not $lapsFound) { Write-Good "No LAPS detected — local admin password may be reused across hosts" }
+else { $findings.Add("LAPS deployed — local admin password is unique & rotated") }
+
+# ============================================================
+# [9/10] SAVED CREDENTIALS / DPAPI / VAULT
+# ============================================================
+Write-Sub "[9/10] Saved credentials"
+try {
+    $ck = cmdkey /list 2>$null
+    $entries = $ck | Where-Object { $_ -match 'Target:' }
+    if ($entries) {
+        Write-Warn "Saved credentials in Credential Manager:"
+        $entries | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
+        $findings.Add("Credential Manager has saved entries — try mimikatz dpapi::cred or vault::list")
+    } else { Write-Good "No saved credentials via cmdkey" }
+} catch {}
+
+# DPAPI master keys folder
+$mk = "$env:APPDATA\Microsoft\Protect"
+if (Test-Path $mk) {
+    $sids = Get-ChildItem $mk -Directory -EA SilentlyContinue
+    foreach ($s in $sids) {
+        $keys = Get-ChildItem $s.FullName -EA SilentlyContinue | Where-Object { $_.Name -match '^[a-f0-9-]{36}$' }
+        if ($keys) { Write-KV "DPAPI MasterKeys for $($s.Name)" "$($keys.Count) key(s)" 'Yellow' }
+    }
+}
+# Vault & Credential files
+$cred = "$env:APPDATA\Microsoft\Credentials"
+if (Test-Path $cred) {
+    $cf = Get-ChildItem $cred -Force -EA SilentlyContinue
+    if ($cf) { Write-KV "Credential blobs" "$($cf.Count) file(s) at $cred" 'Yellow' }
+}
+$vault = "$env:LOCALAPPDATA\Microsoft\Vault"
+if (Test-Path $vault) { Write-KV "Vault dir" $vault 'Yellow' }
+
+# ============================================================
+# [10/10] AlwaysInstallElevated + WDAC active policies
+# ============================================================
+Write-Sub "[10/10] AlwaysInstallElevated + misc priv-esc"
+$aieHKLM = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer' -EA SilentlyContinue).AlwaysInstallElevated
+$aieHKCU = (Get-ItemProperty 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer' -EA SilentlyContinue).AlwaysInstallElevated
+Write-KV "AlwaysInstallElevated HKLM" $aieHKLM ($(if ($aieHKLM -eq 1) {'Red'} else {'Green'}))
+Write-KV "AlwaysInstallElevated HKCU" $aieHKCU ($(if ($aieHKCU -eq 1) {'Red'} else {'Green'}))
+if ($aieHKLM -eq 1 -and $aieHKCU -eq 1) {
+    Write-Bad "AlwaysInstallElevated set in BOTH hives → trivial SYSTEM via .msi"
+    $findings.Add("AlwaysInstallElevated=1 in HKLM+HKCU — SYSTEM via malicious MSI")
+}
+
+# WDAC active policies on disk
+$ciDir = "$env:WINDIR\System32\CodeIntegrity\CiPolicies\Active"
+if (Test-Path $ciDir) {
+    $pols = Get-ChildItem $ciDir -Filter *.cip -EA SilentlyContinue
+    if ($pols) {
+        Write-Warn "WDAC active policies on disk:"
+        $pols | ForEach-Object { Write-Host "    $($_.Name)  ($($_.Length) bytes)" -ForegroundColor Yellow }
+        $findings.Add("WDAC supplemental policies active — binary allow-listing in force")
+    }
+}
+
+# Print Spooler (PrintNightmare gold)
+$ps = Get-Service Spooler -EA SilentlyContinue
+if ($ps) {
+    $col = if ($ps.Status -eq 'Running') {'Yellow'} else {'Green'}
+    Write-KV "Print Spooler" "$($ps.Status) ($($ps.StartType))" $col
+    if ($ps.Status -eq 'Running') { Write-Info "Spooler running — coerce (PetitPotam-like) / driver-load lateral surface" }
+}
+
+# WSH (cscript/wscript) & Office macros toggles (defensa contra phishing inicial)
+try {
+    $wsh = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings' -EA SilentlyContinue).Enabled
+    Write-KV "Windows Script Host Enabled" $(if ($null -eq $wsh) {'default (on)'} else {$wsh})
+} catch {}
+
+# ============================================================
+# SUMMARY OF HIGH-VALUE FINDINGS
+# ============================================================
+Write-Host ""
+Write-Host ("=" * 60) -ForegroundColor DarkYellow
+Write-Host "  HIGH-VALUE FINDINGS" -ForegroundColor Yellow
+Write-Host ("=" * 60) -ForegroundColor DarkYellow
+if ($findings.Count -eq 0) {
+    Write-Host "  (no notable findings flagged)" -ForegroundColor DarkGray
+} else {
+    $i = 1
+    foreach ($f in $findings) {
+        Write-Host ("  [{0:D2}] {1}" -f $i, $f) -ForegroundColor Yellow
+        $i++
+    }
+}
+Write-Host ""

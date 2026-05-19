@@ -1,0 +1,10 @@
+$Path = "$env:USERPROFILE\Desktop\Invoke-HostPostureCheck.ps1"
+# Descargamos el contenido limpio
+$Url = "https://raw.githubusercontent.com/google/ds_python_interpreter/main/Detection_Posture_Audit_v2.ps1" 
+# Nota: Si no tienes salida a internet en esa máquina, salta al Paso 2.
+
+# Opción alternativa si estás en local: Limpiar el archivo existente
+# (Reemplaza 'C:\ruta\tu_script.ps1' por la ruta real de tu archivo)
+$Contenido = Get-Content -Path "C:\ruta\tu_script.ps1" -Raw
+$ContenidoLimpio = $Contenido -replace [char]160, " " -replace [char]8203, ""
+Set-Content -Path $Path -Value $ContenidoLimpio -Encoding UTF8

@@ -7,9 +7,9 @@
 #   - Tamper Protection via Get-MpComputerStatus
 #   - Full coverage restored (spooler, WSH, DPAPI, .cip, etc.)
 # Usage:
-#   .\mod4.ps1                       # console output, returns object
-#   .\mod4.ps1 | ConvertTo-Json -Depth 6 > posture.json
-#   $r = .\mod4.ps1 ; $r.HighValueFindings
+#   .\Invoke-DefensivePosture.ps1                       # console output, returns object
+#   .\Invoke-DefensivePosture.ps1 | ConvertTo-Json -Depth 6 > posture.json
+#   $r = .\Invoke-DefensivePosture.ps1 ; $r.HighValueFindings
 # ============================================================
 
 # --- Estado global ---

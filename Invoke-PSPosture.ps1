@@ -1,6 +1,31 @@
 # ============================================================
-# [MODULE] PowerShell Security Posture (Red Team view)
+# Invoke-PSPosture.ps1
+# PowerShell Security Posture (Red Team view)
 # ============================================================
+# Enumerates:
+#   - PS version, host, language mode, execution policy
+#   - PS profiles (autoruns), PSv2 downgrade, PowerShell 7 separate engine
+#   - Logging: ScriptBlock / Module / Transcription (PS 5.1 + PS 7)
+#   - AMSI providers + DLL signature (MS vs 3rd-party)
+#   - WDAC / Device Guard / VBS / AppLocker
+#   - JEA endpoints, WinRM listeners, CredSSP delegation
+#   - PSReadLine history (creds leak)
+#   - (Optional) AMSI bypass state via AmsiUtils reflection
+#
+# Usage:
+#   .\Invoke-PSPosture.ps1
+#   .\Invoke-PSPosture.ps1 -CheckAmsiBypass    # OPSEC-sensitive
+# ============================================================
+
+param(
+    # Si $true, intenta leer System.Management.Automation.AmsiUtils.amsiInitFailed
+    # OJO: acceder a AmsiUtils via reflection es el patrón inicial de bypasses
+    # conocidos. Algunos EDR tienen firmas para esa secuencia. Solo lectura,
+    # pero úsalo solo si ya estás "quemado" o en un lab.
+    [switch]$CheckAmsiBypass
+)
+
+# --- Helpers de output ---
 function Write-Section($Title) {
     Write-Host ""
     Write-Host ("=" * 60) -ForegroundColor DarkCyan
@@ -27,6 +52,30 @@ Write-KV "Host Version"        $Host.Version
 Write-KV "Process"             "$([System.Diagnostics.Process]::GetCurrentProcess().ProcessName) (PID $PID)"
 Write-KV "Process Arch"        $env:PROCESSOR_ARCHITECTURE
 Write-KV "Is64BitProcess"      ([Environment]::Is64BitProcess)
+
+# --- PowerShell profile scripts (autoruns) ---
+Write-Host ""
+Write-Host "  PowerShell profile scripts (autoruns):" -ForegroundColor Cyan
+$profilePaths = [ordered]@{
+    'AllUsersAllHosts'       = $PROFILE.AllUsersAllHosts
+    'AllUsersCurrentHost'    = $PROFILE.AllUsersCurrentHost
+    'CurrentUserAllHosts'    = $PROFILE.CurrentUserAllHosts
+    'CurrentUserCurrentHost' = $PROFILE.CurrentUserCurrentHost
+}
+foreach ($kv in $profilePaths.GetEnumerator()) {
+    if (Test-Path $kv.Value) {
+        $item = Get-Item $kv.Value -Force
+        Write-KV $kv.Key "$($kv.Value)  ($($item.Length) bytes)" 'Red'
+        Write-Warn "$($kv.Key) profile exists — code runs on every PS start (persistence vector AND defender trap)"
+        try {
+            $preview = Get-Content $kv.Value -TotalCount 5 -EA Stop
+            $preview | ForEach-Object { Write-Host "      | $_" -ForegroundColor DarkGray }
+            if ((Get-Content $kv.Value).Count -gt 5) { Write-Host "      | ..." -ForegroundColor DarkGray }
+        } catch {}
+    } else {
+        Write-KV $kv.Key "(not present)" 'Green'
+    }
+}
 
 # --- LANGUAGE MODE (lo más importante) ---
 Write-Host ""
@@ -70,7 +119,7 @@ try {
 } catch { Write-Info "Get-ExecutionPolicy not available" }
 Write-Info "ExecutionPolicy is NOT a security boundary — bypassable: -ep bypass, -enc, piping into PS, IEX, .ps1 → cmdlets, etc."
 
-# --- PSv2 disponibilidad (downgrade attack para evadir AMSI/logging) ---
+# --- PSv2 engine availability (downgrade attack para evadir AMSI/logging) ---
 Write-Host ""
 Write-Host "  PowerShell v2 engine availability:" -ForegroundColor Cyan
 try {
@@ -80,7 +129,6 @@ try {
         Write-KV "  Registry PowerShellVersion" $v2.PowerShellVersion
         Write-Warn "PSv2 engine registered — possible downgrade target (PSv2 has no AMSI, no ScriptBlock logging)"
     }
-    # Test sin lanzar proceso: ¿está la feature instalada?
     if (Get-Command Get-WindowsOptionalFeature -EA SilentlyContinue) {
         try {
             $feat = Get-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2 -EA Stop
@@ -90,9 +138,56 @@ try {
     }
 } catch { Write-Info "PSv2 info not available" }
 
-# --- LOGGING: ScriptBlock / Module / Transcription ---
+# --- PowerShell 7 (pwsh) — separate engine with independent policies ---
 Write-Host ""
-Write-Host "  PowerShell Logging (HKLM policies):" -ForegroundColor Cyan
+Write-Host "  PowerShell 7 / pwsh:" -ForegroundColor Cyan
+$ps7Found = $false
+$ps7Locations = @(
+    "$env:ProgramFiles\PowerShell\7\pwsh.exe",
+    "${env:ProgramFiles(x86)}\PowerShell\7\pwsh.exe"
+)
+foreach ($p in $ps7Locations) {
+    if (Test-Path $p) {
+        $ps7Found = $true
+        try {
+            $ver = (Get-Item $p).VersionInfo.ProductVersion
+            Write-KV "pwsh.exe" "$p (v$ver)" 'Yellow'
+        } catch { Write-KV "pwsh.exe" $p 'Yellow' }
+    }
+}
+try {
+    $inst = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\PowerShellCore\InstalledVersions' -EA Stop
+    foreach ($i in $inst) {
+        $sv = (Get-ItemProperty $i.PSPath -EA SilentlyContinue).SemanticVersion
+        if ($sv) { Write-Host "    Registered: $sv" -ForegroundColor White; $ps7Found = $true }
+    }
+} catch {}
+
+if ($ps7Found) {
+    Write-Warn "PowerShell 7 installed — has its OWN logging/AMSI policies, INDEPENDENT from PS 5.1"
+    foreach ($k in 'ScriptBlockLogging','ModuleLogging','Transcription') {
+        $path = "HKLM:\SOFTWARE\Policies\Microsoft\PowerShellCore\$k"
+        if (Test-Path $path) {
+            $val = Get-ItemProperty $path -EA SilentlyContinue
+            $field = switch ($k) {
+                'ScriptBlockLogging' { 'EnableScriptBlockLogging' }
+                'ModuleLogging'      { 'EnableModuleLogging' }
+                'Transcription'      { 'EnableTranscripting' }
+            }
+            $on = ($val.$field -eq 1)
+            Write-KV "  PS7 $k" $on ($(if ($on) {'Red'} else {'Green'}))
+        } else {
+            Write-KV "  PS7 $k" "Not configured" 'Green'
+        }
+    }
+    Write-Info "Tip: if PS 5.1 has logging ON and PS 7 doesn't → 'pwsh -c <stuff>' is a free pass"
+} else {
+    Write-Good "PowerShell 7 not installed — only PS 5.1 to deal with"
+}
+
+# --- LOGGING (PS 5.1): ScriptBlock / Module / Transcription ---
+Write-Host ""
+Write-Host "  PowerShell 5.1 Logging (HKLM policies):" -ForegroundColor Cyan
 
 # ScriptBlock Logging
 try {
@@ -129,14 +224,14 @@ try {
     }
 } catch { Write-KV "Transcription" "Not configured" 'Green' }
 
-# También chequear HKCU (puede override en algunos casos)
+# HKCU overrides
 foreach ($k in 'ScriptBlockLogging','ModuleLogging','Transcription') {
     if (Test-Path "HKCU:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\$k") {
         Write-Warn "HKCU policy present for $k (user-level override)"
     }
 }
 
-# --- AMSI Providers registrados ---
+# --- AMSI Providers + signature (MS vs 3rd-party AV/EDR) ---
 Write-Host ""
 Write-Host "  AMSI Providers registered:" -ForegroundColor Cyan
 try {
@@ -148,8 +243,24 @@ try {
         try { $name = (Get-Item "HKLM:\SOFTWARE\Classes\CLSID\$clsid" -EA Stop).GetValue('') } catch {}
         try { $dll  = (Get-Item "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -EA Stop).GetValue('') } catch {}
         Write-Host ("    {0}" -f $clsid) -ForegroundColor Yellow
-        Write-Host ("      Name: {0}" -f $name) -ForegroundColor White
-        Write-Host ("      DLL:  {0}" -f $dll)  -ForegroundColor White
+        Write-Host ("      Name:   {0}" -f $name) -ForegroundColor White
+        Write-Host ("      DLL:    {0}" -f $dll)  -ForegroundColor White
+        # Signature check
+        if ($dll) {
+            $dllExpanded = [Environment]::ExpandEnvironmentVariables($dll)
+            if (Test-Path $dllExpanded) {
+                try {
+                    $sig = Get-AuthenticodeSignature $dllExpanded -EA SilentlyContinue
+                    $subject = $sig.SignerCertificate.Subject
+                    $isMS = $subject -match 'Microsoft (Windows|Corporation)'
+                    $sigCol = if ($isMS) {'DarkGray'} else {'Yellow'}
+                    Write-Host ("      Signer: {0}" -f $subject) -ForegroundColor $sigCol
+                    if (-not $isMS) {
+                        Write-Warn "      → 3rd-party AMSI provider (AV/EDR vendor hook)"
+                    }
+                } catch {}
+            }
+        }
     }
 } catch { Write-Info "Cannot enumerate AMSI providers" }
 
@@ -161,7 +272,7 @@ if ($amsiLoaded) {
     Write-Good "amsi.dll NOT loaded in this process"
 }
 
-# --- WDAC / Device Guard (fuerza CLM si está activo en UMCI) ---
+# --- WDAC / Device Guard / VBS (fuerza CLM si UMCI está enforce) ---
 Write-Host ""
 Write-Host "  Device Guard / WDAC / VBS:" -ForegroundColor Cyan
 try {
@@ -180,7 +291,7 @@ Write-Host ""
 Write-Host "  AppLocker effective policy:" -ForegroundColor Cyan
 try {
     $appS = Get-Service AppIDSvc -EA Stop
-    Write-KV "AppIDSvc"  "$($appS.Status) ($($appS.StartType))"
+    Write-KV "AppIDSvc" "$($appS.Status) ($($appS.StartType))"
     $pol = [xml](Get-AppLockerPolicy -Effective -Xml -EA Stop)
     $coll = $pol.AppLockerPolicy.RuleCollection
     if ($coll) {
@@ -202,6 +313,71 @@ try {
     }
 } catch { Write-Info "Need admin (or remoting) to enumerate session configs" }
 
+# --- WinRM config (listeners, auth, trusted hosts) ---
+Write-Host ""
+Write-Host "  WinRM configuration:" -ForegroundColor Cyan
+$wr = Get-Service WinRM -EA SilentlyContinue
+if ($wr) {
+    $col = if ($wr.Status -eq 'Running') {'Yellow'} else {'DarkGray'}
+    Write-KV "WinRM service" "$($wr.Status) ($($wr.StartType))" $col
+    if ($wr.Status -eq 'Running') { Write-Info "Inbound remoting is up — host is a lateral movement target" }
+}
+# Listeners
+try {
+    $listeners = Get-ChildItem WSMan:\localhost\Listener -EA Stop
+    foreach ($l in $listeners) {
+        $cfg = Get-ChildItem $l.PSPath -EA SilentlyContinue
+        $transport = ($cfg | Where-Object { $_.Name -eq 'Transport' }).Value
+        $port      = ($cfg | Where-Object { $_.Name -eq 'Port' }).Value
+        $col = if ($transport -eq 'HTTP') {'Yellow'} else {'White'}
+        Write-KV "Listener" "$transport on port $port" $col
+    }
+} catch { Write-Info "WSMan listener enumeration failed" }
+# Auth methods (server side)
+try {
+    $svcAuth = Get-ChildItem WSMan:\localhost\Service\Auth -EA Stop
+    foreach ($a in $svcAuth) {
+        $col = if ($a.Name -in @('Basic','CredSSP') -and $a.Value -eq 'true') { 'Red' } else { 'White' }
+        Write-Host ("    Service Auth.{0,-12} = {1}" -f $a.Name, $a.Value) -ForegroundColor $col
+    }
+} catch {}
+# TrustedHosts (client side — outbound)
+try {
+    $th = (Get-Item WSMan:\localhost\Client\TrustedHosts -EA Stop).Value
+    if ($th) {
+        Write-KV "TrustedHosts (client)" $th 'Red'
+        Write-Warn "Outbound WinRM trusts these hosts — creds may flow to them"
+    } else {
+        Write-KV "TrustedHosts (client)" "(empty)" 'Green'
+    }
+} catch {}
+
+# --- CredSSP / Credential Delegation (double-hop) ---
+Write-Host ""
+Write-Host "  CredSSP / credential delegation:" -ForegroundColor Cyan
+try {
+    $cred = Get-WSManCredSSP -EA Stop
+    foreach ($line in ($cred -split "`n")) {
+        if ($line.Trim()) { Write-Host "    $($line.Trim())" -ForegroundColor White }
+    }
+    if ($cred -match 'configured to allow delegating fresh credentials') {
+        Write-Warn "CredSSP outbound delegation enabled — creds will be forwarded to allowed hosts"
+    }
+} catch { Write-Info "Get-WSManCredSSP failed: $_" }
+
+# Registry: AllowFreshCredentials / AllowSavedCredentials / etc.
+foreach ($name in 'AllowFreshCredentials','AllowFreshCredentialsWhenNTLMOnly','AllowSavedCredentials','AllowSavedCredentialsWhenNTLMOnly') {
+    $k = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation\$name"
+    if (Test-Path $k) {
+        $vals = Get-ItemProperty $k -EA SilentlyContinue
+        $entries = $vals.PSObject.Properties | Where-Object { $_.Name -match '^\d+$' }
+        if ($entries) {
+            Write-Warn "$name has entries:"
+            $entries | ForEach-Object { Write-Host "      [$($_.Name)] $($_.Value)" -ForegroundColor Yellow }
+        }
+    }
+}
+
 # --- PSReadLine history (CREDS LEAK!) ---
 Write-Host ""
 Write-Host "  PSReadLine history (potential creds!):" -ForegroundColor Cyan
@@ -212,7 +388,6 @@ try {
         $size = (Get-Item $histPath).Length
         $lines = (Get-Content $histPath -EA SilentlyContinue).Count
         Write-KV "  History size" "$size bytes / $lines lines"
-        # Buscar palabras sensibles
         $juicy = Select-String -Path $histPath -Pattern 'password|passwd|secret|token|apikey|api_key|convertto-secure|credential|-p ' -EA SilentlyContinue
         if ($juicy) {
             Write-Bad "Sensitive keywords found in PS history:"
@@ -232,7 +407,28 @@ foreach ($p in @(
     if (Test-Path $p) { Write-Info "Also present: $p" }
 }
 
-# --- Loaded modules / assemblies sospechosas ---
+# --- AMSI bypass state (opt-in via -CheckAmsiBypass; OPSEC-sensible) ---
+if ($CheckAmsiBypass) {
+    Write-Host ""
+    Write-Host "  AMSI bypass state (reflection on AmsiUtils — may trigger AV):" -ForegroundColor Yellow
+    try {
+        $type = [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')
+        if ($type) {
+            $field = $type.GetField('amsiInitFailed','NonPublic,Static')
+            if ($field) {
+                $failed = $field.GetValue($null)
+                if ($failed) {
+                    Write-Bad "amsiInitFailed = True → AMSI is ALREADY bypassed in this runspace"
+                    Write-Info "Either a prior bypass in this session or a defender artifact"
+                } else {
+                    Write-Good "amsiInitFailed = False → AMSI intact in this runspace"
+                }
+            }
+        }
+    } catch { Write-Info "Could not read amsiInitFailed: $_" }
+}
+
+# --- Loaded modules / assemblies of interest ---
 Write-Host ""
 Write-Host "  Loaded assemblies of interest:" -ForegroundColor Cyan
 $watch = @('System.Management.Automation','System.Reflection','Microsoft.PowerShell','amsi')

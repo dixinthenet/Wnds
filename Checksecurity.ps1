@@ -398,18 +398,40 @@ Add-Result $cat 'Modulo OSConfig presente' ($(if($osc){'Activo'}else{'Inactivo'}
 if ($osc) {
     try {
         Import-Module Microsoft.OSConfig -ErrorAction Stop
-        $applied = $false; $compliantTxt = ''
-        foreach ($scn in 'SecurityBaseline/WS2025/MemberServer','SecurityBaseline/WS2025/DomainController','SecurityBaseline/WS2025/WorkgroupMember') {
-            try {
-                $st = Get-OSConfigDesiredConfiguration -Scenario $scn -ErrorAction Stop
-                if ($st) { $applied = $true; $compliantTxt += "$scn: $($st.ComplianceStatus); " }
-            } catch { }
+
+        # Descubrir el cmdlet de consulta disponible (el nombre varia entre versiones del modulo)
+        $getCmd = Get-Command -Module Microsoft.OSConfig -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like 'Get-OSConfig*' } |
+                  Select-Object -First 1
+
+        if (-not $getCmd) {
+            Add-Result $cat 'OSConfig - baseline aplicado y cumplimiento' 'Sin datos' `
+                'Modulo presente pero sin cmdlet Get-OSConfig* en esta version. Verificar manualmente con: Get-Command -Module Microsoft.OSConfig' 'No (opt-in)'
         }
-        if ($applied) {
-            $baseState = if ($compliantTxt -match 'NonCompliant|Drift') {'Parcial'} else {'Activo'}
-            Add-Result $cat 'OSConfig - baseline aplicado y cumplimiento' $baseState $compliantTxt 'No (opt-in)'
-        } else {
-            Add-Result $cat 'OSConfig - baseline aplicado y cumplimiento' 'Inactivo' 'Ningun escenario de baseline desplegado' 'No (opt-in)'
+        else {
+            $applied = $false; $compliantTxt = ''
+            foreach ($scn in 'SecurityBaseline/WS2025/MemberServer','SecurityBaseline/WS2025/DomainController','SecurityBaseline/WS2025/WorkgroupMember') {
+                try {
+                    # El cmdlet devuelve una LISTA de ajustes, cada uno con propiedad Compliance
+                    $items = @(& $getCmd.Name -Scenario $scn -ErrorAction Stop)
+                    if ($items.Count -gt 0) {
+                        $applied = $true
+                        $notComp = @($items | Where-Object { $_.PSObject.Properties['Compliance'] -and $_.Compliance -match 'NotCompliant' }).Count
+                        $total   = $items.Count
+                        $compliantTxt += "$scn=$($total-$notComp)/$total OK; "
+                    }
+                } catch { }
+            }
+            if ($applied) {
+                # Activo si todos los escenarios reportan X/Y con X==Y; Parcial si algun ajuste no conforme
+                $baseState = 'Activo'
+                foreach ($m in [regex]::Matches($compliantTxt,'(\d+)/(\d+) OK')) {
+                    if ([int]$m.Groups[1].Value -lt [int]$m.Groups[2].Value) { $baseState = 'Parcial'; break }
+                }
+                Add-Result $cat 'OSConfig - baseline aplicado y cumplimiento' $baseState $compliantTxt 'No (opt-in)'
+            } else {
+                Add-Result $cat 'OSConfig - baseline aplicado y cumplimiento' 'Inactivo' "Ningun escenario de baseline desplegado (cmdlet: $($getCmd.Name))" 'No (opt-in)'
+            }
         }
     } catch {
         Add-Result $cat 'OSConfig - baseline aplicado y cumplimiento' 'Sin datos' "No se pudo evaluar: $($_.Exception.Message)" 'No (opt-in)'

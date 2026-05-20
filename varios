@@ -23,3 +23,17 @@ $invokeParams[0] = $srpiArgs
 
 # Invoca
 $asm.EntryPoint.Invoke($null, $invokeParams)
+
+
+
+
+
+
+# 1. Guardar la contraseña de forma segura
+$Password = Read-Host -AsSecureString "Introduce la contraseña para Labuser"
+
+# 2. Crear el usuario local
+New-LocalUser -Name "Labuser" -Password $Password -FullName "Usuario de Laboratorio" -Description "Cuenta para pruebas"
+
+# 3. Añadir el usuario al grupo
+Add-LocalGroupMember -Group "Usuarios" -Member "Labuser"

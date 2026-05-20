@@ -116,12 +116,36 @@ $ppl = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RunAsPPL'
 $pplState = if ($ppl -in 1,2) {'Activo'} elseif ($null -eq $ppl) {'Inactivo'} else {'Parcial'}
 Add-Result $cat 'LSASS protegido (RunAsPPL)' $pplState "RunAsPPL=$ppl (1 o 2 = activo)" 'Parcial / recomendado forzar'
 
-# LAPS
-$lapsState = if (Get-Module -ListAvailable -Name LAPS -ErrorAction SilentlyContinue) {
+# NTLM - restriccion de trafico entrante (WS2025 empuja hacia Kerberos/IAKerb)
+$ntlmIn = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'RestrictReceivingNTLMTraffic'
+$ntlmInState = if ($ntlmIn -in 1,2) {'Activo'} else {'Inactivo'}
+Add-Result $cat 'NTLM - restriccion de trafico entrante' $ntlmInState "RestrictReceivingNTLMTraffic=$ntlmIn (1=deniega cuentas dominio, 2=deniega todo)" 'No (recomendado en WS2025)'
+
+# NTLM - restriccion de trafico saliente
+$ntlmOut = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'RestrictSendingNTLMTraffic'
+$ntlmOutState = if ($ntlmOut -in 1,2) {'Activo'} else {'Inactivo'}
+Add-Result $cat 'NTLM - restriccion de trafico saliente' $ntlmOutState "RestrictSendingNTLMTraffic=$ntlmOut (1=auditar, 2=denegar todo)" 'No (recomendado)'
+
+# NTLM - nivel de compatibilidad LM/NTLM (este SI viene endurecido por defecto)
+$lmc = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LmCompatibilityLevel'
+$lmcState = if ($null -eq $lmc -or $lmc -ge 3) {'Activo'} elseif ($lmc -ge 1) {'Parcial'} else {'Inactivo'}
+Add-Result $cat 'NTLM - nivel de compatibilidad (LM/NTLMv1)' $lmcState "LmCompatibilityLevel=$lmc (>=3 = solo NTLMv2; vacio=default seguro)" 'Si (>=3 por defecto)'
+
+# LAPS (Windows LAPS nativo de WS2025, NO el legacy AdmPwd.PS)
+$lapsNative = Get-Command Get-LapsADPassword -ErrorAction SilentlyContinue
+$lapsLegacy = Get-Module -ListAvailable -Name AdmPwd.PS -ErrorAction SilentlyContinue
+if ($lapsNative) {
     $pol = Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Policies\LAPS' 'BackupDirectory'
-    if ($pol) {'Activo'} else {'Parcial'}
-} else {'Inactivo'}
-Add-Result $cat 'Windows LAPS (rotacion admin local)' $lapsState 'Modulo LAPS y politica BackupDirectory' 'No (opt-in)'
+    $lapsState = if ($pol -in 1,2) {'Activo'} else {'Parcial'}
+    $lapsDetail = "Windows LAPS nativo presente; BackupDirectory=$pol (1=Entra,2=AD)"
+} elseif ($lapsLegacy) {
+    $lapsState = 'Parcial'
+    $lapsDetail = 'Detectado LAPS legacy (AdmPwd.PS); migrar al LAPS nativo de WS2025'
+} else {
+    $lapsState = 'Inactivo'
+    $lapsDetail = 'Sin cmdlets de Windows LAPS ni modulo legacy'
+}
+Add-Result $cat 'Windows LAPS (rotacion admin local)' $lapsState $lapsDetail 'No (opt-in)'
 
 # ---------------------------------------------------------------------------
 # 2. ACTIVE DIRECTORY (solo relevante en dominio)
@@ -265,9 +289,20 @@ Add-Result $cat 'Transcription' ($(if($tr -eq 1){'Activo'}else{'Inactivo'})) "En
 $pel = Get-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\ProtectedEventLogging' 'EnableProtectedEventLogging'
 Add-Result $cat 'Protected Event Logging' ($(if($pel -eq 1){'Activo'}else{'Inactivo'})) "EnableProtectedEventLogging=$pel" 'No (opt-in)'
 
-# Execution Policy
-$ep = try { Get-ExecutionPolicy -Scope LocalMachine } catch { 'Desconocido' }
-Add-Result $cat 'Execution Policy (LocalMachine)' 'Parcial' "Valor=$ep (medida debil, no es control real)" 'RemoteSigned'
+# Execution Policy: reportar la EFECTIVA y si una GPO la fuerza
+try {
+    $epEffective = Get-ExecutionPolicy                       # politica resultante real
+    $epList      = Get-ExecutionPolicy -List
+    $epMachineGPO = ($epList | Where-Object Scope -eq 'MachinePolicy').ExecutionPolicy
+    $epUserGPO    = ($epList | Where-Object Scope -eq 'UserPolicy').ExecutionPolicy
+    $forcedByGPO  = ($epMachineGPO -ne 'Undefined') -or ($epUserGPO -ne 'Undefined')
+    $epDetail = "Efectiva=$epEffective; GPO-Maquina=$epMachineGPO; GPO-Usuario=$epUserGPO"
+    if ($forcedByGPO) { $epDetail += ' (forzada por GPO)' }
+} catch {
+    $epEffective = 'Desconocido'; $epDetail = 'No consultable'
+}
+# Siempre 'Parcial': la Execution Policy NO es un control de seguridad real (evitable con -Bypass)
+Add-Result $cat 'Execution Policy (efectiva)' 'Parcial' "$epDetail -- medida debil, evitable con -Bypass" 'RemoteSigned'
 
 # JEA
 try {
@@ -297,6 +332,10 @@ try {
     } else {
         Add-Result $cat 'SMB over QUIC' 'Sin datos' 'Propiedad EnableSMBQUIC no expuesta en esta build' 'No (opt-in)'
     }
+
+    # SMB Encryption (cifrado del canal, un paso mas alla del signing)
+    $smbEnc = $smb.EncryptData
+    Add-Result $cat 'SMB Encryption' ($(if($smbEnc){'Activo'}else{'Inactivo'})) "EncryptData=$smbEnc" 'No (opt-in, complementa al signing)'
 } catch {
     Add-Result $cat 'SMB signing (servidor)' 'Sin datos' 'Modulo SMB no disponible' 'Reforzado'
 }
@@ -346,6 +385,20 @@ try {
     Add-Result $cat 'OpenSSH server (sshd)' $sshState "Estado=$($sshd.Status), Inicio=$($sshd.StartType)" 'Instalado pero apagado'
 } catch {
     Add-Result $cat 'OpenSSH server (sshd)' 'Inactivo' 'Servicio sshd no presente/instalado' 'Instalado pero apagado'
+}
+
+# RDP: esta habilitado? (contexto para NLA)
+$rdpDeny = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections'
+$rdpEnabled = ($rdpDeny -eq 0)
+Add-Result $cat 'RDP habilitado' ($(if($rdpEnabled){'Activo'}else{'Inactivo'})) "fDenyTSConnections=$rdpDeny (0=RDP activo)" 'Apagado por defecto'
+
+# RDP con Network Level Authentication (NLA)
+$nla = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'UserAuthentication'
+if (-not $rdpEnabled) {
+    Add-Result $cat 'RDP - Network Level Authentication (NLA)' 'No aplicable' "RDP deshabilitado; UserAuthentication=$nla" 'Si (cuando RDP esta activo)'
+} else {
+    $nlaState = if ($nla -eq 1) {'Activo'} else {'Inactivo'}
+    Add-Result $cat 'RDP - Network Level Authentication (NLA)' $nlaState "UserAuthentication=$nla (1=NLA exigido)" 'Si'
 }
 
 # ---------------------------------------------------------------------------

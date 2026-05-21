@@ -1,74 +1,22 @@
-Raro. Desde PowerShell en Server 2025 debería funcionar. Vamos a diagnosticar:Pivoted toward direct PowerShell commands for hands-on debuggingPivoted toward direct PowerShell commands for hands-on debuggingCopia y pega estos comandos en PowerShell en tu Windows Server 2025:
-powershell# Paso 1: Verifica que CLRUnhook.exe existe
-dir "C:\ruta\completa\CLRUnhook.exe"
+# Ejecuta estos comandos en Server 2025 y comparte output
 
-# Paso 2: Ejecutalo y captura TODO el output
-$output = & "C:\ruta\completa\CLRUnhook.exe" 2>&1
-Write-Host $output
-Write-Host "Exit Code: $LASTEXITCODE"
+Write-Host "=== DIAGNOSTICO ===" 
+Write-Host "[1] Language Mode:"
+$ExecutionContext.SessionState.LanguageMode
 
-# Paso 3: Si sigue sin output, intenta remotamente en PowerShell actual
-& "C:\ruta\completa\CLRUnhook.exe" | Tee-Object -FilePath "output.txt"
-type "output.txt"
+Write-Host "[2] .NET Framework:"
+[System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
 
-# Paso 4: Prueba con un proceso remoto (PowerShell mismo)
-& "C:\ruta\completa\CLRUnhook.exe" powershell.exe
+Write-Host "[3] Execution Policy:"
+Get-ExecutionPolicy
 
-Si AÚN no funciona, intenta esto:
-powershell# Opción A: Ejecutar con .NET (calling it directly from CLR)
-Add-Type -Path "C:\ruta\a\CLRUnhook.exe"
+Write-Host "[4] ¿Puedes leer clr.dll?"
+try {
+    $bytes = [System.IO.File]::ReadAllBytes("C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll")
+    Write-Host "SI - tamaño: $('{0:N0}' -f $bytes.Length) bytes"
+} catch {
+    Write-Host "NO - Error: $_"
+}
 
-# Opción B: Check if it's compiled correctly
-[System.Diagnostics.FileVersionInfo]::GetVersionInfo("C:\ruta\completa\CLRUnhook.exe")
-
-# Opción C: Ejecutar desde cmd.exe (para ver si es un problema de PowerShell)
-cmd /c "C:\ruta\completa\CLRUnhook.exe"
-
-Si NADA funciona, el problema probablemente es:
-
-No compilaste bien - Vuelve a compilar en Release mode
-Falta dependencias - Necesita VC++ runtime
-Permisos - Probablemente necesita admin (aunque PowerShell en Server suele correr como admin)
-El archivo no es ejecutable - Reintenta compilar
-
-
-Dale a Dix qué información necesito:
-
-¿Qué ves cuando ejecutas dir CLRUnhook.exe? (¿Existe el archivo?)
-¿Qué ves cuando ejecutas & "C:\...\CLRUnhook.exe" 2>&1?
-¿Qué exit code devuelve? ($LASTEXITCODE)
-¿El archivo tiene signature de Microsoft o está bloqueado?
-
-
-Sospecha principal:
-En Windows Server 2025 puede haber una política de ejecución restringida o SmartScreen bloqueando CLRUnhook.exe.
-Prueba:
-powershell# Desbloquea el archivo si está marcado como "untrusted"
-Unblock-File -Path "C:\ruta\completa\CLRUnhook.exe"
-
-# Luego ejecuta de nuevo
-& "C:\ruta\completa\CLRUnhook.exe"
-
-O más probable aún:
-El programa se ejecuta pero falla silenciosamente porque clr.dll no está donde espera o tiene un path hardcoded.
-Mira la línea 378 del código:
-cppconst char* DllPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\clr.dll";
-En Windows Server 2025, ¿está clr.dll en esa ruta exacta?
-powershell# Verifica
-Test-Path "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll"
-
-# Si no existe, encuentra dónde está:
-Get-ChildItem -Path "C:\Windows\Microsoft.NET" -Recurse -Filter "clr.dll" -ErrorAction SilentlyContinue
-Si ese es el problema, necesitas modificar el código fuente para que busque clr.dll dinámicamente en lugar de hardcodear la ruta.
-
-
-
-# 1. Obtén la ruta real de clr.dll
-$clrPath = (Get-ChildItem -Path "C:\Windows\Microsoft.NET" -Recurse -Filter "clr.dll" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-Write-Host "CLR en: $clrPath"
-
-# 2. Ejecuta CLRUnhook
-& "C:\path\to\CLRUnhook.exe"
-
-# 3. Si falla, intenta crear un symlink/junction point para que la ruta exista
-# (avanzado - solo si la opción 1 falla)
+Write-Host "[5] ¿Eres Admin?"
+([Security.Principal.WindowsIdentity]::GetCurrent().Groups -contains [Security.Principal.SecurityIdentifier]"S-1-5-32-544")

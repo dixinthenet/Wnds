@@ -60,3 +60,15 @@ Test-Path "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll"
 # Si no existe, encuentra dónde está:
 Get-ChildItem -Path "C:\Windows\Microsoft.NET" -Recurse -Filter "clr.dll" -ErrorAction SilentlyContinue
 Si ese es el problema, necesitas modificar el código fuente para que busque clr.dll dinámicamente en lugar de hardcodear la ruta.
+
+
+
+# 1. Obtén la ruta real de clr.dll
+$clrPath = (Get-ChildItem -Path "C:\Windows\Microsoft.NET" -Recurse -Filter "clr.dll" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+Write-Host "CLR en: $clrPath"
+
+# 2. Ejecuta CLRUnhook
+& "C:\path\to\CLRUnhook.exe"
+
+# 3. Si falla, intenta crear un symlink/junction point para que la ruta exista
+# (avanzado - solo si la opción 1 falla)

